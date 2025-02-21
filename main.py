@@ -5,10 +5,48 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import numpy as np
 import datetime
 import pandas as pd
+from fastapi import FastAPI, BackgroundTasks
+import joblib
+from pathlib import Path
+import asyncio
 
-def get_btc_data():
+MODEL_PATH = "crypto_model.pkl"
+
+app = FastAPI()
+is_training = False  # Флаг для отслеживания состояния обучения
+
+def train_and_save_model(df):
+    model = train_model(df)
+    joblib.dump(model, MODEL_PATH)
+
+def load_model():
+    if Path(MODEL_PATH).exists():
+        return joblib.load(MODEL_PATH)
+    return None
+
+async def train_model_async(crypto: str):
+    global is_training
+    if is_training:
+        return
+    is_training = True
+    try:
+        loop = asyncio.get_event_loop()
+        # Загрузка данных в отдельном потоке
+        btc_data = await loop.run_in_executor(None, get_crypto_data, crypto)
+        # Подготовка данных
+        prepared_data, _ = await loop.run_in_executor(None, prepare_features, btc_data)
+        # Обучение модели
+        await loop.run_in_executor(None, train_and_save_model, prepared_data)
+    finally:
+        is_training = False
+
+@app.on_event("startup")
+async def startup_event():
+    # Асинхронно запускаем обучение модели при старте
+    asyncio.create_task(train_model_async("BTC"))
+
+def get_crypto_data(crypto):
     end_time = datetime.datetime.now(datetime.timezone.utc)
-    # Округляем до ближайшего завершенного часа
     rounded_end_time = end_time.replace(minute=0, second=0, microsecond=0)
     if rounded_end_time > end_time:
         rounded_end_time -= datetime.timedelta(hours=1)
@@ -20,11 +58,12 @@ def get_btc_data():
     all_data = []
     
     current_end = end_timestamp
-    while len(all_data) < 50000:
+    max_iterations = 50  # Защита от бесконечного цикла
+    while len(all_data) < 50000 and max_iterations > 0:
         params = {
             "category": "linear",
-            "symbol": "BTCUSDT",
-            "interval": "60",  # Часовой интервал
+            "symbol": f"{crypto}USDT",
+            "interval": "60",
             "end": current_end,
             "limit": limit
         }
@@ -37,12 +76,13 @@ def get_btc_data():
             raise Exception(f"API Error: {data['retMsg']}")
         
         klines = data["result"]["list"]
-        all_data.extend(klines)
-        
-        if len(klines) < limit:
+        if not klines:
             break
         
-        current_end = int(float(klines[-1][0]))
+        all_data.extend(klines)
+        # Обновляем current_end для следующего запроса
+        current_end = int(float(klines[-1][0])) - 3600 * 1000  # Предыдущий час
+        max_iterations -= 1
     
     all_data = all_data[:50000]
     
@@ -67,15 +107,13 @@ def get_btc_data():
     return df
 
 def prepare_features(df):
-    # Скользящие средние
-    df['SMA_24'] = df['Close'].rolling(24).mean()    # 24 часа
-    df['SMA_168'] = df['Close'].rolling(168).mean()  # 1 неделя
-    df['SMA_720'] = df['Close'].rolling(720).mean()  # 30 дней
+    df = df.copy()  # Создаем копию для устранения предупреждения
+    df['SMA_24'] = df['Close'].rolling(24).mean()
+    df['SMA_168'] = df['Close'].rolling(168).mean()
+    df['SMA_720'] = df['Close'].rolling(720).mean()
     
-    # Волатильность
     df['Volatility_24'] = df['Close'].rolling(24).std()
     
-    # RSI
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -84,25 +122,22 @@ def prepare_features(df):
     rs = avg_gain / avg_loss
     df['RSI_14'] = 100 - (100 / (1 + rs))
     
-    # MACD
     ema12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
-    # Bollinger Bands
     sma20 = df['Close'].rolling(20).mean()
     std20 = df['Close'].rolling(20).std()
+    
     df['Bollinger_Upper'] = sma20 + 2 * std20
     df['Bollinger_Lower'] = sma20 - 2 * std20
     
-    # Удаление NaN
     df = df.dropna()
     
-    # Целевая переменная (цена через час)
     df['Target'] = df['Close'].shift(-1)
     
-    # Последняя строка для предсказания
     last_row = df[df['Target'].isna()].copy()
     df = df.dropna()
     
@@ -120,7 +155,6 @@ def train_model(df):
     X = df[features]
     y = df['Target']
     
-    # Используем TimeSeriesSplit для временных рядов
     tscv = TimeSeriesSplit(n_splits=5)
     
     model = RandomForestRegressor(random_state=42, n_jobs=-1)
@@ -134,7 +168,6 @@ def train_model(df):
     grid_search.fit(X, y)
     best_model = grid_search.best_estimator_
     
-    # Оценка на последнем фолде
     last_train_idx, last_test_idx = list(tscv.split(X))[-1]
     X_train, X_test = X.iloc[last_train_idx], X.iloc[last_test_idx]
     y_train, y_test = y.iloc[last_train_idx], y.iloc[last_test_idx]
@@ -152,23 +185,23 @@ def train_model(df):
     
     return best_model
 
-def evaluate_model(model, X_test, y_test):
-    y_pred = model.predict(X_test)
-    print(f"MAE: {mean_absolute_error(y_test, y_pred):.2f}")
-    print(f"RMSE: {np.sqrt(mean_squared_error(y_test, y_pred)):.2f}")
-
-def main():
+@app.get("/api/crypto/predict/{crypto}")
+async def getPrediction(crypto: str, background_tasks: BackgroundTasks):
+    global is_training
     try:
-        btc_data = get_btc_data()  # 1 год данных
-        prepared_data, last_row = prepare_features(btc_data)
+        model = load_model()
+        if model is None:
+            if not is_training:
+                background_tasks.add_task(train_model_async, crypto)
+            return {"message": "Модель обучается, попробуйте позже"}
         
-        if len(prepared_data) < 100:
-            raise ValueError("Недостаточно данных для обучения")
-            
+        loop = asyncio.get_event_loop()
+        # Загрузка данных в отдельном потоке
+        btc_data = await loop.run_in_executor(None, get_crypto_data, crypto)
+        prepared_data, last_row = await loop.run_in_executor(None, prepare_features, btc_data)
+        
         if last_row.empty:
             raise ValueError("Нет данных для прогноза")
-        
-        model = train_model(prepared_data)
         
         features = [
             'Open', 'High', 'Low', 'Close', 'Volume',
@@ -182,13 +215,14 @@ def main():
         current_price = last_row['Close'].iloc[0]
         next_time = last_row.index[0] + datetime.timedelta(hours=1)
         
-        print(f"\nТекущая цена BTC: ${current_price:.2f}")
-        print(f"Прогноз на {next_time.strftime('%Y-%m-%d %H:%M')}: ${prediction:.2f}")
+        response = {
+            "prediction": prediction, 
+            "prediction_time": next_time.strftime('%Y-%m-%d %H:%M'),
+            "current_price": current_price
+        }
         
-        evaluate_model(model, prepared_data[features], prepared_data['Target'])
+        return response
         
     except Exception as e:
         print(f"Ошибка: {e}")
-
-if __name__ == "__main__":
-    main()
+        return {"error": str(e)}
